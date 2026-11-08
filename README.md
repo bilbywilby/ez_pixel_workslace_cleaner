@@ -1,4 +1,347 @@
+
 #!/usr/bin/env python3
+"""
+Workspace Guardian - Binary Deduplication & Hardlinking Utility
+Optimized for developer workspaces, high-capacity scanning, and zero-downtime disk space reclamation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import hashlib
+import json
+import logging
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Generator, List, Optional, Set, Tuple
+
+# Set up clean structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("WorkspaceGuardian")
+
+
+@dataclass(frozen=True)
+class FileRecord:
+    """Immutable record tracking discovered file metadata."""
+    path: Path
+    size_bytes: int
+
+
+class WorkspaceScanner:
+    """Recursively scans workspace paths while respecting strict exclusion rules."""
+
+    DEFAULT_EXCLUSIONS: Set[str] = {
+        ".git", ".git_archive", "node_modules", ".venv", "venv", ".cache", "__pycache__"
+    }
+
+    def __init__(self, root_dir: Path, min_size_mb: int = 20, extra_excludes: Optional[Set[str]] = None) -> None:
+        self.root_dir = root_dir
+        self.min_size_bytes = min_size_mb * 1024 * 1024
+        self.exclude_dirs = self.DEFAULT_EXCLUSIONS.union(extra_excludes or set())
+
+    def scan(self) -> Generator[FileRecord, None, None]:
+        """Yield qualifying files exceeding size limits while bypassing excluded subtrees."""
+        if not self.root_dir.exists():
+            logger.warning("Root target path does not exist: %s", self.root_dir)
+            return
+
+        for root, dirs, files in os.walk(self.root_dir, topdown=True):
+            # Exclude directory patterns in-place to prevent scanning corruptible structures (.git, etc.)
+            dirs[:] = [d for d in dirs if d not in self.exclude_dirs]
+
+            for file_name in files:
+                file_path = Path(root) / file_name
+                if file_path.is_file() and not file_path.is_symlink():
+                    try:
+                        stat = file_path.stat()
+                        if stat.st_size >= self.min_size_bytes:
+                            yield FileRecord(path=file_path, size_bytes=stat.st_size)
+                    except (PermissionError, FileNotFoundError) as err:
+                        logger.debug("Skipped unreadable file %s: %s", file_path, err)
+
+
+class DeduplicationEngine:
+    """Identifies byte-identical duplicates and manages hardlinking operations safely."""
+
+    def __init__(self, records: List[FileRecord], dry_run: bool = True, max_workers: int = 4) -> None:
+        self.records = records
+        self.dry_run = dry_run
+        self.max_workers = max_workers
+
+    @staticmethod
+    def _hash_file(path: Path, chunk_size: int = 65536) -> Optional[Tuple[str, Path]]:
+        """Reads file in buffered chunks to avoid memory bloat and returns SHA-256 hash."""
+        sha256 = hashlib.sha256()
+        try:
+            with open(path, "rb") as f:
+                while chunk := f.read(chunk_size):
+                    sha256.update(chunk)
+            return sha256.hexdigest(), path
+        except Exception as e:
+            logger.error("Failed to hash %s: %s", path, e)
+            return None
+
+    def find_duplicates(self) -> Dict[str, List[Path]]:
+        """Groups candidate files by size before executing concurrent SHA-256 hash validation."""
+        size_groups: Dict[int, List[Path]] = {}
+        for r in self.records:
+            size_groups.setdefault(r.size_bytes, []).append(r.path)
+
+        candidates = [p for group in size_groups.values() if len(group) > 1 for p in group]
+        if not candidates:
+            return {}
+
+        logger.info("Computing SHA-256 checksums across %d candidates...", len(candidates))
+        hash_groups: Dict[str, List[Path]] = {}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = [executor.submit(self._hash_file, path) for path in candidates]
+            for future in concurrent.futures.as_completed(futures):
+                res = future.result()
+                if res:
+                    h, path = res
+                    hash_groups.setdefault(h, []).append(path)
+
+        return {h: paths for h, paths in hash_groups.items() if len(paths) > 1}
+
+    def execute_hardlinking(self, duplicates: Dict[str, List[Path]]) -> Tuple[int, int]:
+        """Hardlinks duplicate files to the primary instance using atomic temporary replacement."""
+        linked_count = 0
+        failed_count = 0
+
+        for file_hash, paths in duplicates.items():
+            primary = paths[0]
+            redundants = paths[1:]
+
+            logger.info("Group [%s...] Primary file: %s", file_hash[:10], primary)
+
+            for r in redundants:
+                if self.dry_run:
+                    logger.info("  [DRY-RUN] Would hardlink: %s -> %s", r, primary)
+                    linked_count += 1
+                    continue
+
+                try:
+                    # Atomic hardlink creation using temporary file target
+                    temp_link = r.with_suffix(f"{r.suffix}.tmp_link")
+                    primary.hardlink_to(temp_link)
+                    temp_link.replace(r)
+                    logger.info("  [OPTIMIZED] Hardlinked: %s -> %s", r, primary)
+                    linked_count += 1
+                except Exception as e:
+                    logger.error("  [FAILED] Could not hardlink %s: %e", r, e)
+                    failed_count += 1
+
+        return linked_count, failed_count
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="WorkspaceGuardian - Binary Deduplication & Hardlinking Utility")
+    parser.add_argument("--root", type=Path, default=Path.home(), help="Root search path")
+    parser.add_argument("--min-size-mb", type=int, default=20, help="Minimum file size in MiB to process")
+    parser.add_argument("--live", action="store_true", help="Execute live hardlink replacement (disables dry-run mode)")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    dry_run = not args.live
+
+    logger.info("Initializing WorkspaceGuardian (Dry-run: %s, Min Size: %d MiB)", dry_run, args.min_size_mb)
+
+    scanner = WorkspaceScanner(root_dir=args.root, min_size_mb=args.min_size_mb)
+    records = list(scanner.scan())
+    logger.info("Found %d files matching size criteria.", len(records))
+
+    engine = DeduplicationEngine(records=records, dry_run=dry_run)
+    duplicates = engine.find_duplicates()
+
+    total_dupes = sum(len(paths) - 1 for paths in duplicates.values())
+    logger.info("Found %d duplicate file groups (%d total redundant files).", len(duplicates), total_dupes)
+
+    linked, failed = engine.execute_hardlinking(duplicates)
+    logger.info("Completed processing. Hardlinked: %d, Failures: %d", linked, failed)
+
+
+if __name__ == "__main__":
+    main()
+```
+#!/usr/bin/env python3
+"""
+Workspace Guardian - Binary Deduplication & Hardlinking Utility
+Optimized for developer workspaces, high-capacity scanning, and zero-downtime disk space reclamation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import hashlib
+import json
+import logging
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Generator, List, Optional, Set, Tuple
+
+# Set up clean structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("WorkspaceGuardian")
+
+
+@dataclass(frozen=True)
+class FileRecord:
+    """Immutable record tracking discovered file metadata."""
+    path: Path
+    size_bytes: int
+
+
+class WorkspaceScanner:
+    """Recursively scans workspace paths while respecting strict exclusion rules."""
+
+    DEFAULT_EXCLUSIONS: Set[str] = {
+        ".git", ".git_archive", "node_modules", ".venv", "venv", ".cache", "__pycache__"
+    }
+
+    def __init__(self, root_dir: Path, min_size_mb: int = 20, extra_excludes: Optional[Set[str]] = None) -> None:
+        self.root_dir = root_dir
+        self.min_size_bytes = min_size_mb * 1024 * 1024
+        self.exclude_dirs = self.DEFAULT_EXCLUSIONS.union(extra_excludes or set())
+
+    def scan(self) -> Generator[FileRecord, None, None]:
+        """Yield qualifying files exceeding size limits while bypassing excluded subtrees."""
+        if not self.root_dir.exists():
+            logger.warning("Root target path does not exist: %s", self.root_dir)
+            return
+
+        for root, dirs, files in os.walk(self.root_dir, topdown=True):
+            # Exclude directory patterns in-place to prevent scanning corruptible structures (.git, etc.)
+            dirs[:] = [d for d in dirs if d not in self.exclude_dirs]
+
+            for file_name in files:
+                file_path = Path(root) / file_name
+                if file_path.is_file() and not file_path.is_symlink():
+                    try:
+                        stat = file_path.stat()
+                        if stat.st_size >= self.min_size_bytes:
+                            yield FileRecord(path=file_path, size_bytes=stat.st_size)
+                    except (PermissionError, FileNotFoundError) as err:
+                        logger.debug("Skipped unreadable file %s: %s", file_path, err)
+
+
+class DeduplicationEngine:
+    """Identifies byte-identical duplicates and manages hardlinking operations safely."""
+
+    def __init__(self, records: List[FileRecord], dry_run: bool = True, max_workers: int = 4) -> None:
+        self.records = records
+        self.dry_run = dry_run
+        self.max_workers = max_workers
+
+    @staticmethod
+    def _hash_file(path: Path, chunk_size: int = 65536) -> Optional[Tuple[str, Path]]:
+        """Reads file in buffered chunks to avoid memory bloat and returns SHA-256 hash."""
+        sha256 = hashlib.sha256()
+        try:
+            with open(path, "rb") as f:
+                while chunk := f.read(chunk_size):
+                    sha256.update(chunk)
+            return sha256.hexdigest(), path
+        except Exception as e:
+            logger.error("Failed to hash %s: %s", path, e)
+            return None
+
+    def find_duplicates(self) -> Dict[str, List[Path]]:
+        """Groups candidate files by size before executing concurrent SHA-256 hash validation."""
+        size_groups: Dict[int, List[Path]] = {}
+        for r in self.records:
+            size_groups.setdefault(r.size_bytes, []).append(r.path)
+
+        candidates = [p for group in size_groups.values() if len(group) > 1 for p in group]
+        if not candidates:
+            return {}
+
+        logger.info("Computing SHA-256 checksums across %d candidates...", len(candidates))
+        hash_groups: Dict[str, List[Path]] = {}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = [executor.submit(self._hash_file, path) for path in candidates]
+            for future in concurrent.futures.as_completed(futures):
+                res = future.result()
+                if res:
+                    h, path = res
+                    hash_groups.setdefault(h, []).append(path)
+
+        return {h: paths for h, paths in hash_groups.items() if len(paths) > 1}
+
+    def execute_hardlinking(self, duplicates: Dict[str, List[Path]]) -> Tuple[int, int]:
+        """Hardlinks duplicate files to the primary instance using atomic temporary replacement."""
+        linked_count = 0
+        failed_count = 0
+
+        for file_hash, paths in duplicates.items():
+            primary = paths[0]
+            redundants = paths[1:]
+
+            logger.info("Group [%s...] Primary file: %s", file_hash[:10], primary)
+
+            for r in redundants:
+                if self.dry_run:
+                    logger.info("  [DRY-RUN] Would hardlink: %s -> %s", r, primary)
+                    linked_count += 1
+                    continue
+
+                try:
+                    # Atomic hardlink creation using temporary file target
+                    temp_link = r.with_suffix(f"{r.suffix}.tmp_link")
+                    primary.hardlink_to(temp_link)
+                    temp_link.replace(r)
+                    logger.info("  [OPTIMIZED] Hardlinked: %s -> %s", r, primary)
+                    linked_count += 1
+                except Exception as e:
+                    logger.error("  [FAILED] Could not hardlink %s: %e", r, e)
+                    failed_count += 1
+
+        return linked_count, failed_count
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="WorkspaceGuardian - Binary Deduplication & Hardlinking Utility")
+    parser.add_argument("--root", type=Path, default=Path.home(), help="Root search path")
+    parser.add_argument("--min-size-mb", type=int, default=20, help="Minimum file size in MiB to process")
+    parser.add_argument("--live", action="store_true", help="Execute live hardlink replacement (disables dry-run mode)")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    dry_run = not args.live
+
+    logger.info("Initializing WorkspaceGuardian (Dry-run: %s, Min Size: %d MiB)", dry_run, args.min_size_mb)
+
+    scanner = WorkspaceScanner(root_dir=args.root, min_size_mb=args.min_size_mb)
+    records = list(scanner.scan())
+    logger.info("Found %d files matching size criteria.", len(records))
+
+    engine = DeduplicationEngine(records=records, dry_run=dry_run)
+    duplicates = engine.find_duplicates()
+
+    total_dupes = sum(len(paths) - 1 for paths in duplicates.values())
+    logger.info("Found %d duplicate file groups (%d total redundant files).", len(duplicates), total_dupes)
+
+    linked, failed = engine.execute_hardlinking(duplicates)
+    logger.info("Completed processing. Hardlinked: %d, Failures: %d", linked, failed)
+
+
+if __name__ == "__main__":
+    main()#!/usr/bin/env python3
 """
 Enterprise Workspace Optimizer & Duplicate Detection Utility
 Adheres to SOLID, KISS, and PEP 8 standards with concurrent hashing,
